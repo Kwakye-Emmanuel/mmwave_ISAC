@@ -1,0 +1,40 @@
+# ISAC Sensing-Aided PLS Simulation
+# IEEE GLOBECOM 2026
+# ============================================================
+#
+# INSTALL (standard):
+#     pip install -r requirements.txt
+#
+# INSTALL PyTorch separately (avoids SSL issues on Windows):
+#
+#     CUDA 12.1 (NVIDIA GPU recommended for training):
+#         pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+#     CUDA 11.8:
+#         pip install torch --index-url https://download.pytorch.org/whl/cu118
+#
+#     CPU only:
+#         pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# SETUP (Windows PowerShell):
+#     python -m venv .venv
+#     .venv\Scripts\Activate.ps1
+#     pip install -r requirements.txt
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+# ============================================================
+
+# Core numerical
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Plotting
+matplotlib>=3.7.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Configuration
+pyyaml>=6.0
+
+# Deep learning (install separately -- see note above)
+# torch>=2.0.0
