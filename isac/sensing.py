@@ -1,334 +1,458 @@
-"""Sensing stage for ISAC-aided physical layer security.
+"""sensing.py — ISAC sensing stage for physical layer security.
 
-Implements ULA steering, DFT codebook, echo simulation, MLE angle
-estimation, LS path-gain estimation, and closed-form CRB for the
-ISAC sensing stage.
+Implements the sensing pipeline from:
+    [Su24] N. Su, F. Liu, C. Masouros, IEEE TWC, 2024.  (CAML paper)
+    [Cao25] Y. Cao et al., IEEE TWC, 2025.  (closed-form CRB, single Eve)
 
-Handoff to communication module:
-    theta_hat : float    -- MLE angle estimate [rad]
-    crb       : float    -- CRB(theta_E) [rad^2]
-    at_hat    : NDArray  -- alpha_t(theta_hat), shape (M,)
-
-Reference:
-    [Cao25] Y. Cao et al., IEEE TWC, 2025.  Eqs. (5)-(16).
 """
 from __future__ import annotations
-
 import numpy as np
 from numpy.typing import NDArray
 
 
-# ---------------------------------------------------------------------------
-# ULA steering vector and derivative norm  (paper eq. 5, eq. 12)
-# ---------------------------------------------------------------------------
+# Step 1 — Steering vector and its derivative
 
-def ula_steering(theta: float, N: int) -> NDArray[np.complexfloating]:
-    """Centre-referenced ULA steering vector (paper eq. 5).
+def steering_vector(angle_deg: float, N: int) -> NDArray[np.complexfloating]:
+    """ULA steering vector — matches channel_mmwave.py exactly.
 
-    alpha(theta) in C^{N}, half-wavelength spacing:
-        alpha_n = exp(j * pi * sin(theta) * (n - (N-1)/2)),  n = 0,...,N-1
+    a(theta) in C^N, half-wavelength spacing, center-referenced:
+        a_n = exp(-j * pi * (n - (N-1)/2) * sin(theta))
 
-    Guaranteed properties:
-        ||alpha||^2 = N
-        alpha^H * d(alpha)/dtheta = 0  (cross-FIM terms vanish in CRB)
-
-    Args:
-        theta : angle [radians], theta in (-pi/2, pi/2)
-        N     : number of antennas
-    Returns:
-        alpha : (N,) complex steering vector
-    """
-    n = np.arange(N) - (N - 1) / 2
-    return np.exp(1j * np.pi * np.sin(theta) * n)
-
-
-def ula_dot_norm_sq(theta: float, N: int) -> float:
-    """Squared norm of ULA derivative vector, used in CRB (paper eq. 12).
-
-    ||alpha_tilde||^2 = (pi * cos(theta))^2 * N * (N^2 - 1) / 12
-
-    where alpha_tilde = d(alpha)/d(theta) = j*pi*cos(theta)*Phi*alpha,
-    Phi = diag(-(N-1)/2, -(N-3)/2, ..., (N-1)/2).
-
-    Returns:
-        float
-    """
-    return (np.pi * np.cos(theta)) ** 2 * N * (N ** 2 - 1) / 12.0
-
-
-# ---------------------------------------------------------------------------
-# DFT sensing codebook  (paper eq. 6)
-# ---------------------------------------------------------------------------
-
-def dft_codebook(
-    L: int,
-    M: int,
-) -> tuple[NDArray[np.complexfloating], NDArray[np.floating]]:
-    """DFT beam codebook with L beams (paper eq. 6).
-
-    Beam directions: theta_l = arcsin(-1 + (2l-1)/L),  l = 1,...,L
-    Beam vectors:    v(l) = (1/sqrt(M)) * alpha(theta_l)
-
-    Requires L >= M for R_X = (Ps/M)*I_{M} to hold (paper eq. 9).
+    Properties guaranteed:
+        |a_n| = 1  for all n          (purely imaginary exponent)
+        ||a||^2 = N                   (constant modulus)
+        a^H(theta) * da/dtheta = 0   (orthogonality — needed for FIM)
 
     Args:
-        L : number of sensing beams
-        M : number of transmit antennas
+        angle_deg : angle in degrees, in (-90, 90)
+        N         : number of antennas
+
     Returns:
-        B      : (M, L) codebook matrix, unit-norm columns
-        thetas : (L,) beam centre angles [radians]
+        a : (N,) complex steering vector
     """
-    l        = np.arange(1, L + 1)
-    sin_vals = np.clip(-1.0 + (2.0 * l - 1.0) / L, -1 + 1e-9, 1 - 1e-9)
-    thetas   = np.arcsin(sin_vals)
-    B        = np.column_stack(
-        [ula_steering(t, M) / np.sqrt(M) for t in thetas]
-    )
-    return B, thetas
+    theta_rad = np.deg2rad(angle_deg)
+    sin_theta = np.sin(theta_rad)
+    indices   = np.arange(N) - (N - 1) / 2
+    return np.exp(-1j * np.pi * indices * sin_theta)
 
 
-# ---------------------------------------------------------------------------
-# Radar path-gain magnitude  (paper eq. after eq. 7)
-# ---------------------------------------------------------------------------
+def steering_deriv(angle_deg: float, N: int) -> NDArray[np.complexfloating]:
+    """Derivative of ULA steering vector w.r.t. theta in RADIANS.
 
-def compute_beta_s(
-    d_be:         float,
-    f_c:          float = 28e9,
-    epsilon_dBsm: float = 7.0,
-) -> float:
-    """Round-trip path-gain magnitude from the radar equation.
+    da(theta)/d(theta_rad) = -j * pi * cos(theta) * Phi * a(theta)
 
-    |beta_s|^2 = lambda^2 * epsilon / (64 * pi^3 * d_be^4)
+    where Phi = diag(-(N-1)/2, ..., (N-1)/2)  [Su24 Eq.(11-12)]
 
-    Random phase applied externally per trial.
+    This is used in the FIM as Ȧ (receive) and Ḃ (transmit).
+
+    Verified property:
+        ||da/dtheta||^2 = pi^2 * cos^2(theta) * N*(N^2-1)/12
 
     Args:
-        d_be         : BS-Eve distance [m]
-        f_c          : carrier frequency [Hz]   (default 28 GHz)
-        epsilon_dBsm : radar cross section [dBsm] (default 7 dBsm)
+        angle_deg : angle in degrees
+        N         : number of antennas
+
     Returns:
-        |beta_s| (float, positive)
+        da : (N,) complex derivative vector  [units: 1/radian]
     """
-    lam     = 3e8 / f_c
-    epsilon = 10 ** (epsilon_dBsm / 10.0)
-    return float(
-        np.sqrt((lam ** 2 * epsilon) / (64.0 * np.pi ** 3 * d_be ** 4))
-    )
+    theta_rad = np.deg2rad(angle_deg)
+    cos_theta = np.cos(theta_rad)
+    indices   = np.arange(N) - (N - 1) / 2
+    a         = steering_vector(angle_deg, N)
+    return -1j * np.pi * cos_theta * indices * a
 
 
-# ---------------------------------------------------------------------------
-# Echo signal simulator  (paper eqs. 7-8)
-# ---------------------------------------------------------------------------
+def steering_deriv_norm_sq(angle_deg: float, N: int) -> float:
+    """Closed-form squared norm of steering derivative [Su24 Eq.(12)].
+
+    ||da/dtheta||^2 = pi^2 * cos^2(theta) * N*(N^2-1) / 12
+
+    Avoids computing the full derivative vector when only the
+    norm is needed (e.g. closed-form CRB calculation).
+
+    Args:
+        angle_deg : angle in degrees
+        N         : number of antennas
+
+    Returns:
+        float : ||da/dtheta||^2  [units: 1/radian^2]
+    """
+    theta_rad = np.deg2rad(angle_deg)
+    return (np.pi * np.cos(theta_rad))**2 * N * (N**2 - 1) / 12.0
+
+
+
+# # Step 1 test
+
+# if __name__ == "__main__":
+#     import numpy as np
+
+#     N   = 8
+#     ang = 30.0
+
+#     a  = steering_vector(ang, N)
+#     da = steering_deriv(ang, N)
+
+#     print("=== Step 1: Steering vector and derivative ===\n")
+
+#     print(f"[1] Constant modulus: all |a_n|=1 ? "
+#           f"{np.allclose(np.abs(a), 1.0)}")
+
+#     print(f"[2] ||a||^2 = {np.sum(np.abs(a)**2):.4f}  "
+#           f"(expected {N})")
+
+#     print(f"[3] Orthogonality a^H·da = "
+#           f"{a.conj() @ da:.2e}  (expected 0)")
+
+#     norm_numerical = np.sum(np.abs(da)**2)
+#     norm_formula   = steering_deriv_norm_sq(ang, N)
+#     print(f"[4] ||da||^2 numerical = {norm_numerical:.6f}")
+#     print(f"    ||da||^2 formula   = {norm_formula:.6f}")
+#     print(f"    Match: {np.isclose(norm_numerical, norm_formula)}")
+
+#     print(f"\n[5] Convention check (must match channel_mmwave.py):")
+#     print(f"    a[0]  = {a[0]:.6f}")
+#     print(f"    a[-1] = {a[-1]:.6f}")
+#     print(f"    (expected: 0.707107-0.707107j and 0.707107+0.707107j)")
+
+
+# Step 2 — Transmit covariance matrix
+
+def compute_RX(
+    N_t : int,
+    W   : NDArray[np.complexfloating] | None = None,
+    R_N : NDArray[np.complexfloating] | None = None,
+    P0  : float = 1.0,
+) -> NDArray[np.complexfloating]:
+    """Transmit covariance matrix R_X  [Su24 Eq.(13)].
+
+    Two cases:
+        Omnidirectional probe (W=None, R_N=None):
+            R_X = (P0/N_t) * I_{N_t}
+            Used at initialization — power spread equally
+            in all directions for initial Eve detection.
+
+        Beamforming case (W and R_N provided):
+            R_X = W @ W^H + R_N
+            Used after W and R_N are designed.
+
+    Args:
+        N_t : number of transmit antennas
+        W   : (N_t, I) beamforming matrix, or None
+        R_N : (N_t, N_t) AN covariance matrix, or None
+        P0  : total transmit power [W]  (used only if W is None)
+
+    Returns:
+        R_X : (N_t, N_t) transmit covariance matrix
+    """
+    if W is None and R_N is None:
+        # omnidirectional probe — Stage 0
+        return (P0 / N_t) * np.eye(N_t, dtype=complex)
+
+    if W is None or R_N is None:
+        raise ValueError(
+            "W and R_N must both be provided or both be None."
+        )
+
+    return W @ W.conj().T + R_N
+
+
+# # Step 2 test
+
+# if __name__ == "__main__":
+
+#     N_t = 8
+#     P0  = 1.0
+#     I   = 3        # number of CUs
+
+#     print("=== Step 2: Transmit covariance R_X ===\n")
+
+#     # --- Case 1: omnidirectional probe ---
+#     R_omni = compute_RX(N_t, W=None, R_N=None, P0=P0)
+
+#     print("[Case 1] Omnidirectional probe:")
+#     print(f"  Shape         : {R_omni.shape}")
+#     print(f"  Is diagonal   : {np.allclose(R_omni, np.diag(np.diag(R_omni)))}")
+#     print(f"  Diagonal value: {R_omni[0,0].real:.6f}  "
+#           f"(expected {P0/N_t:.6f})")
+#     print(f"  tr(R_X)       : {np.trace(R_omni).real:.6f}  "
+#           f"(expected {P0:.6f})")
+
+#     # --- Case 2: beamforming case ---
+#     rng = np.random.default_rng(42)
+#     W   = (rng.standard_normal((N_t, I))
+#            + 1j * rng.standard_normal((N_t, I))) / np.sqrt(2)
+#     R_N = np.eye(N_t) * 0.1
+
+#     R_bf = compute_RX(N_t, W=W, R_N=R_N, P0=P0)
+
+#     print(f"\n[Case 2] Beamforming case:")
+#     print(f"  Shape            : {R_bf.shape}")
+#     print(f"  Is Hermitian     : "
+#           f"{np.allclose(R_bf, R_bf.conj().T)}")
+#     print(f"  Is PSD (min eig) : "
+#           f"{np.linalg.eigvalsh(R_bf).min():.6f}  (expected >= 0)")
+#     print(f"  tr(R_X)          : {np.trace(R_bf).real:.6f}  "
+#           f"(expected {np.trace(W@W.conj().T).real + 0.1*N_t:.6f})")
+
+# Step 3 — Echo signal simulator
 
 def simulate_echo(
-    theta_E:  float,
-    M_t:      int,
-    M_r:      int,
-    L:        int,
-    P_s:      float,
-    sigma2_s: float,
-    beta_s:   complex,
-    seed:     int | None = None,
-) -> NDArray[np.complexfloating]:
-    """Simulate echo observation matrix Y (paper eq. 8).
+    theta_E_deg : float,
+    beta        : complex,
+    N_t         : int,
+    N_r         : int,
+    L           : int,
+    P0          : float,
+    sigma2_R    : float,
+    W           : NDArray[np.complexfloating] | None = None,
+    R_N         : NDArray[np.complexfloating] | None = None,
+    seed        : int | None = None,
+) -> tuple[NDArray[np.complexfloating], NDArray[np.complexfloating]]:
+    """Simulate radar echo matrix Y_R  [Su24 Eq.(6)].
 
-    Y = beta_s * alpha_r(theta_E) * alpha_t^H(theta_E) * X + N
+    Y_R = beta * a(theta_E) * b^H(theta_E) * X + Z_R
 
     where:
-        X[:,l] = sqrt(P_s) * v(l) = sqrt(P_s/M_t) * alpha_t(theta_l)
-        N[:,l] ~ CN(0, sigma_s^2 * I_{M_r})
+        a(theta_E) : (N_r,) receive steering vector
+        b(theta_E) : (N_t,) transmit steering vector
+        X          : (N_t, L) transmitted waveform
+        Z_R        : (N_r, L) noise, columns ~ CN(0, sigma2_R * I)
+
+    Waveform X is generated to satisfy:
+        (1/L) * X @ X^H ≈ R_X = compute_RX(N_t, W, R_N, P0)
 
     Args:
-        theta_E  : true Eve angle [radians]
-        M_t      : transmit antennas
-        M_r      : receive antennas
-        L        : number of sensing beams
-        P_s      : sensing transmit power [W]
-        sigma2_s : sensing noise variance [W]
-        beta_s   : complex round-trip path gain
-        seed     : random seed (None for unseeded)
+        theta_E_deg : true Eve angle [degrees]
+        beta        : complex round-trip path gain
+        N_t         : number of transmit antennas
+        N_r         : number of receive antennas
+        L           : number of snapshots  (L >= N_t recommended)
+        P0          : total transmit power [W]
+        sigma2_R    : radar noise variance [W]
+        W           : (N_t, I) beamforming matrix, or None for omni
+        R_N         : (N_t, N_t) AN covariance, or None for omni
+        seed        : random seed for reproducibility
+
     Returns:
-        Y : (M_r, L) complex echo matrix
+        Y : (N_r, L) complex echo matrix
+        X : (N_t, L) transmitted waveform  (kept for CAML estimator)
     """
-    rng    = np.random.default_rng(seed)
-    B, _   = dft_codebook(L, M_t)
-    X      = np.sqrt(P_s) * B                               # (M_t, L)
-    ar     = ula_steering(theta_E, M_r)                     # (M_r,)
-    at     = ula_steering(theta_E, M_t)                     # (M_t,)
-    signal = beta_s * np.outer(ar, at.conj()) @ X           # (M_r, L)
-    noise  = np.sqrt(sigma2_s / 2.0) * (
-        rng.standard_normal((M_r, L))
-        + 1j * rng.standard_normal((M_r, L))
-    )
-    return signal + noise
+    rng = np.random.default_rng(seed)
+
+    # --- transmit waveform X satisfying (1/L) X X^H = R_X ---
+    R_X = compute_RX(N_t, W, R_N, P0)
+
+    # Cholesky factorization: R_X = L_chol @ L_chol^H
+    # X = L_chol @ randn(N_t, L) * sqrt(L)
+    # Then (1/L) X X^H → R_X as L → inf
+    try:
+        L_chol = np.linalg.cholesky(R_X + 1e-12 * np.eye(N_t))
+    except np.linalg.LinAlgError:
+        L_chol = np.linalg.cholesky(R_X + 1e-9 * np.eye(N_t))
+
+    S = (rng.standard_normal((N_t, L))
+         + 1j * rng.standard_normal((N_t, L))) / np.sqrt(2)
+    X = L_chol @ S           # (N_t, L)
+
+    # --- steering vectors ---
+    a = steering_vector(theta_E_deg, N_r)         # (N_r,) receive
+    b = steering_vector(theta_E_deg, N_t)         # (N_t,) transmit
+
+    # --- echo signal ---
+    # signal = beta * outer(a, b^H) @ X
+    # shape:  (N_r,) * (N_r, N_t) @ (N_t, L) = (N_r, L)
+    signal = beta * np.outer(a, b.conj()) @ X     # (N_r, L)
+
+    # --- noise: each column ~ CN(0, sigma2_R * I_Nr) ---
+    noise = (np.sqrt(sigma2_R / 2.0)
+             * (rng.standard_normal((N_r, L))
+                + 1j * rng.standard_normal((N_r, L))))
+
+    return signal + noise, X
 
 
-# ---------------------------------------------------------------------------
-# MLE angle estimator  (paper eq. 15)
-# ---------------------------------------------------------------------------
+# # Step 3 test
 
-def mle_estimate(
-    Y:          NDArray[np.complexfloating],
-    M_t:        int,
-    M_r:        int,
-    L:          int,
-    P_s:        float,
+# if __name__ == "__main__":
+
+#     N_t      = 8
+#     N_r      = 8
+#     L        = 64
+#     P0       = 1.0
+#     sigma2_R = 1e-3
+#     theta_E  = 25.0                          # degrees
+#     beta     = (0.8 + 0.6j) * 1e-3          # complex path gain
+
+#     print("=== Step 3: Echo simulator ===\n")
+
+#     Y, X = simulate_echo(
+#         theta_E_deg = theta_E,
+#         beta        = beta,
+#         N_t         = N_t,
+#         N_r         = N_r,
+#         L           = L,
+#         P0          = P0,
+#         sigma2_R    = sigma2_R,
+#         seed        = 42,
+#     )
+
+#     print(f"[1] Y shape : {Y.shape}  (expected ({N_r}, {L}))")
+#     print(f"[2] X shape : {X.shape}  (expected ({N_t}, {L}))")
+
+#     # Check waveform covariance ≈ R_X = (P0/N_t)*I
+#     R_X_empirical = (X @ X.conj().T) / L
+#     R_X_expected  = (P0 / N_t) * np.eye(N_t)
+#     print(f"\n[3] Waveform covariance check:")
+#     print(f"    Diagonal mean  : {np.diag(R_X_empirical).real.mean():.6f}  "
+#           f"(expected {P0/N_t:.6f})")
+#     print(f"    Off-diag mean  : "
+#           f"{np.abs(R_X_empirical - np.diag(np.diag(R_X_empirical))).mean():.6f}  "
+#           f"(expected ~0, improves with larger L)")
+
+#     # Check echo SNR — signal power vs noise power
+#     a = steering_vector(theta_E, N_r)
+#     b = steering_vector(theta_E, N_t)
+#     signal_power = abs(beta)**2 * float(np.real(
+#         b.conj() @ R_X_expected @ b
+#     )) * N_r
+#     noise_power  = sigma2_R
+#     snr_dB       = 10 * np.log10(signal_power / noise_power)
+#     print(f"\n[4] Echo SNR : {snr_dB:.2f} dB")
+#     print(f"    |beta|^2  : {abs(beta)**2:.2e}")
+#     print(f"    Signal power : {signal_power:.2e}")
+#     print(f"    Noise power  : {noise_power:.2e}")
+
+#     print(f"\n[5] Y stats:")
+#     print(f"    Mean power per element : {np.mean(np.abs(Y)**2):.6e}")
+#     print(f"    Max |Y_ij|             : {np.max(np.abs(Y)):.6e}")
+
+
+# ---------------------------------------------------------------
+# Step 4 — Capon spectrum and angle estimation
+# ---------------------------------------------------------------
+
+def capon_spectrum(
+    Y         : NDArray[np.complexfloating],
+    N_r       : int,
     theta_grid: NDArray[np.floating],
-) -> tuple[float, NDArray[np.floating]]:
-    """MLE angle estimate for Eve's direction (paper eq. 15).
+) -> NDArray[np.floating]:
+    """Capon spatial spectrum from echo matrix Y  [Su24 Section IV].
 
-    theta_hat_E = argmax_{theta} |alpha_r^H(theta) * Y * X^H * alpha_t(theta)|^2
+    P_Capon(theta) = 1 / (a^H(theta) * R_hat^{-1} * a(theta))
 
-    For the DFT codebook with L >= M_t, the denominator
-    ||X^H * alpha_t||^2 is constant, so the argmax of the
-    numerator alone is the exact MLE.
+    where R_hat = (1/L) * Y @ Y^H  is the sample covariance
+    of the received echo.
+
+    The Capon spectrum has super-resolution — it can resolve
+    closely-spaced sources better than a standard FFT beamformer.
 
     Args:
-        Y          : (M_r, L) echo observation matrix
-        M_t, M_r   : transmit / receive antennas
-        L          : number of sensing beams
-        P_s        : sensing transmit power [W]
-        theta_grid : candidate angles to search [radians]
+        Y          : (N_r, L) complex echo matrix
+        N_r        : number of receive antennas
+        theta_grid : (G,) angles to evaluate [degrees]
+
     Returns:
-        theta_hat : MLE angle estimate [radians]
-        spectrum  : raw objective values over theta_grid
+        spectrum : (G,) real Capon spectrum values
     """
-    B, _     = dft_codebook(L, M_t)
-    X        = np.sqrt(P_s) * B                             # (M_t, L)
+    L = Y.shape[1]
+
+    # sample covariance of echo
+    R_hat = (Y @ Y.conj().T) / L                  # (N_r, N_r)
+
+    # regularize for numerical stability
+    R_hat = R_hat + 1e-10 * np.eye(N_r)
+
+    # invert once — reuse for all angles
+    R_inv = np.linalg.inv(R_hat)                  # (N_r, N_r)
+
     spectrum = np.zeros(len(theta_grid))
+    for i, theta in enumerate(theta_grid):
+        a          = steering_vector(theta, N_r)   # (N_r,)
+        denom      = np.real(a.conj() @ R_inv @ a)
+        spectrum[i] = 1.0 / denom
 
-    for i, th in enumerate(theta_grid):
-        ar          = ula_steering(th, M_r)
-        at          = ula_steering(th, M_t)
-        u           = ar.conj() @ Y          # alpha_r^H Y,  shape (L,)
-        v           = X.conj().T @ at        # X^H alpha_t,  shape (L,)
-        spectrum[i] = abs(np.dot(u, v)) ** 2
+    return spectrum
 
+
+def estimate_angle(
+    Y          : NDArray[np.complexfloating],
+    N_r        : int,
+    theta_grid : NDArray[np.floating],
+) -> tuple[float, NDArray[np.floating]]:
+    """Estimate Eve's angle from echo using Capon  [Su24 Section IV].
+
+    theta_hat = argmax_{theta} P_Capon(theta)
+
+    Args:
+        Y          : (N_r, L) complex echo matrix
+        N_r        : number of receive antennas
+        theta_grid : (G,) search grid [degrees]
+
+    Returns:
+        theta_hat : float, estimated angle [degrees]
+        spectrum  : (G,) Capon spectrum (for inspection/plotting)
+    """
+    spectrum  = capon_spectrum(Y, N_r, theta_grid)
     theta_hat = float(theta_grid[np.argmax(spectrum)])
     return theta_hat, spectrum
 
 
-def mle_estimate_beta(
-    Y:         NDArray[np.complexfloating],
-    theta_hat: float,
-    M_t:       int,
-    M_r:       int,
-    L:         int,
-    P_s:       float,
-) -> complex:
-    """LS estimate of round-trip path gain beta_s (paper, after eq. 15).
+# ---------------------------------------------------------------
+# Step 4 test
+# ---------------------------------------------------------------
+if __name__ == "__main__":
 
-    beta_hat_s = (vec(q(theta_hat)))^H * vec(Y) / ||vec(q(theta_hat))||^2
+    import numpy as np
 
-    where q(theta) = alpha_r(theta) * alpha_t^H(theta) * X.
+    N_t      = 8
+    N_r      = 8
+    L        = 64
+    P0       = 1.0
+    sigma2_R = 1e-6     # low noise → high SNR → Capon should be precise
+    theta_E  = 25.0     # true Eve angle [degrees]
+    beta     = (0.8 + 0.6j) * 1e-2
 
-    Args:
-        Y         : (M_r, L) echo observation matrix
-        theta_hat : MLE angle estimate [radians]
-        M_t, M_r  : transmit / receive antennas
-        L         : number of sensing beams
-        P_s       : sensing transmit power [W]
-    Returns:
-        beta_hat_s : complex path-gain estimate
-    """
-    B, _  = dft_codebook(L, M_t)
-    X     = np.sqrt(P_s) * B
-    ar    = ula_steering(theta_hat, M_r)
-    at    = ula_steering(theta_hat, M_t)
-    Q     = np.outer(ar, at.conj()) @ X                     # (M_r, L)
-    vQ    = Q.flatten()
-    vY    = Y.flatten()
-    return complex((vQ.conj() @ vY) / (vQ.conj() @ vQ))
+    print("=== Step 4: Capon spectrum and angle estimation ===\n")
 
-
-# ---------------------------------------------------------------------------
-# Cramér-Rao bound  (paper eq. 16, Theorem 1)
-# ---------------------------------------------------------------------------
-
-def crb_theta(
-    theta_E:  float,
-    M_t:      int,
-    M_r:      int,
-    L:        int,
-    P_s:      float,
-    sigma2_s: float,
-    beta_mag: float,
-) -> float:
-    """Closed-form CRB for Eve's angle theta_E (paper eq. 16).
-
-    CRB(theta_E) = sigma_s^2
-                   / (2 * L * P_s * |beta_s|^2
-                      * (||alpha_tilde_r||^2 + M_r/M_t * ||alpha_tilde_t||^2))
-
-    Estimation error modelled as N(0, CRB(theta_E)):
-        P(|theta_hat - theta_E| <= 3*sqrt(CRB)) = 0.9973.
-
-    Args:
-        theta_E  : true Eve angle [radians]
-        M_t, M_r : transmit / receive antennas
-        L        : number of DFT beams  (L >= M_t recommended)
-        P_s      : sensing transmit power [W]
-        sigma2_s : sensing noise variance [W]
-        beta_mag : |beta_s|, round-trip path-gain magnitude
-    Returns:
-        CRB(theta_E) in radians^2
-    """
-    J = (
-        2.0 * L * beta_mag ** 2 * P_s / sigma2_s
-        * (
-            ula_dot_norm_sq(theta_E, M_r)
-            + M_r * ula_dot_norm_sq(theta_E, M_t) / M_t
-        )
+    # generate echo
+    Y, X = simulate_echo(
+        theta_E_deg = theta_E,
+        beta        = beta,
+        N_t         = N_t,
+        N_r         = N_r,
+        L           = L,
+        P0          = P0,
+        sigma2_R    = sigma2_R,
+        seed        = 42,
     )
-    return 1.0 / J
 
+    # angle grid — 0.1 degree resolution
+    theta_grid = np.linspace(-90.0, 90.0, 1801)
 
-# ---------------------------------------------------------------------------
-# Sensing state  (output handed to the communication module)
-# ---------------------------------------------------------------------------
+    theta_hat, spectrum = estimate_angle(Y, N_r, theta_grid)
 
-def run_sensing(
-    theta_E:  float,
-    M_t:      int,
-    M_r:      int,
-    L:        int,
-    P_s:      float,
-    sigma2_s: float,
-    beta_s:   complex,
-    seed:     int | None = None,
-) -> dict:
-    """Run one sensing stage trial and return the sensing state.
+    print(f"[1] True angle    : {theta_E:.2f} deg")
+    print(f"[2] Estimated     : {theta_hat:.2f} deg")
+    print(f"[3] Error         : {abs(theta_hat - theta_E):.4f} deg")
+    print(f"[4] Peak spectrum : {spectrum.max():.4e}")
+    print(f"[5] Peak at index : {np.argmax(spectrum)}")
 
-    Executes: simulate_echo -> mle_estimate -> mle_estimate_beta -> crb_theta.
+    # test with low SNR
+    Y_low, _ = simulate_echo(
+        theta_E_deg = theta_E,
+        beta        = beta,
+        N_t         = N_t,
+        N_r         = N_r,
+        L           = L,
+        P0          = P0,
+        sigma2_R    = 1e-2,   # higher noise
+        seed        = 42,
+    )
+    theta_hat_low, _ = estimate_angle(Y_low, N_r, theta_grid)
 
-    The returned dict is the handoff to the communication module:
-        theta_hat : MLE angle estimate [radians]
-        crb       : CRB(theta_E) [radians^2]
-        at_hat    : alpha_t(theta_hat), shape (M_t,)  -- for AN design
-        beta_hat  : estimated round-trip path gain (complex)
-
-    Args:
-        theta_E  : true Eve angle [radians]
-        M_t, M_r : transmit / receive antennas
-        L        : number of sensing beams
-        P_s      : sensing transmit power [W]
-        sigma2_s : sensing noise variance [W]
-        beta_s   : complex round-trip path gain (magnitude + random phase)
-        seed     : random seed
-    Returns:
-        sensing_state : dict with keys theta_hat, crb, at_hat, beta_hat
-    """
-    theta_grid = np.linspace(-np.pi / 2, np.pi / 2, 1801)
-
-    Y         = simulate_echo(theta_E, M_t, M_r, L, P_s, sigma2_s, beta_s, seed)
-    theta_hat, _ = mle_estimate(Y, M_t, M_r, L, P_s, theta_grid)
-    beta_hat  = mle_estimate_beta(Y, theta_hat, M_t, M_r, L, P_s)
-    crb       = crb_theta(theta_E, M_t, M_r, L, P_s, sigma2_s, abs(beta_s))
-    at_hat    = ula_steering(theta_hat, M_t)
-
-    return {
-        "theta_hat": theta_hat,
-        "crb":       crb,
-        "at_hat":    at_hat,
-        "beta_hat":  beta_hat,
-    }
+    print(f"\n[6] Low SNR test:")
+    print(f"    True angle : {theta_E:.2f} deg")
+    print(f"    Estimated  : {theta_hat_low:.2f} deg")
+    print(f"    Error      : {abs(theta_hat_low - theta_E):.4f} deg")
+    print(f"    (larger error expected at low SNR)")

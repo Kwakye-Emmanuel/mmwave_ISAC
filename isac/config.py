@@ -1,6 +1,6 @@
-"""Central configuration for ISAC-aided physical layer security simulation.
+"""Central configuration for mmWave ISAC physical layer security simulation.
 
-All parameters match the paper's Table I and system model exactly.
+All parameters based on CAML paper (Su et al.) numerical results section.
 Every other module imports from this file — no scattered magic numbers.
 
 Usage:
@@ -10,106 +10,52 @@ Usage:
 """
 from __future__ import annotations
 
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 
 
 @dataclass
 class SystemConfig:
-    """Complete system and training configuration.
-
-    Parameters match paper Table I exactly.
-    """
 
     # ----------------------------------------------------------------
-    # Antenna configuration
+    # Antenna configuration  (paper Section VII)
     # ----------------------------------------------------------------
-    M:   int = 8    # BS transmit antennas
-    M_r: int = 8    # BS receive antennas (M_r = M, symmetric ULA)
+    N_t: int = 10   # BS transmit antennas
+    N_r: int = 10   # BS receive antennas
 
     # ----------------------------------------------------------------
-    # User and scheduling
+    # User and scheduling  (paper Section VII)
     # ----------------------------------------------------------------
-    N:  int = 10   # total CUs
-    Kd: int = 2    # scheduled users per frame
+    N: int = 10    # total CUs
+    K: int = 2     # scheduled users per frame
 
     # ----------------------------------------------------------------
-    # Sensing stage  (Cao et al. TWC 2025, Table I)
+    # Channel model  (CAML paper Eq. 2, Section VII)
     # ----------------------------------------------------------------
-    L:            int   = 16       # sensing beams (L > M=8)
-    P_s_dBm:      float = 20.0    # sensing transmit power [dBm]
-    sigma2_dBm:   float = -110.0  # sensing noise power [dBm]
-    f_c:          float = 28e9    # carrier frequency [Hz] (code only)
-    epsilon_dBsm: float = 7.0     # radar cross section [dBsm]
+    kappa:            float = 0.1    # Rician K-factor (weak LoS)
+    L_p:              int   = 3      # NLoS scattering paths per CU
+    sigma_alpha:      float = 1.0    # Eve path-loss std dev
+    theta_E_min_deg:  float = -30.0  # Eve angle min [deg]
+    theta_E_max_deg:  float =  30.0  # Eve angle max [deg]
+    cu_angle_min_deg: float = -90.0  # CU LoS angle min [deg]
+    cu_angle_max_deg: float =  90.0  # CU LoS angle max [deg]
 
     # ----------------------------------------------------------------
-    # Channel model  (paper eq. 3, Table I)
+    # Signal model  (paper Section VII)
     # ----------------------------------------------------------------
-    eta:  float = 2.5    # path loss exponent
-
-    # Path loss reference (separate from Eve distance):
-    #   beta_k = (d_0 / d_k)^eta
-    #   At d_k = d_0 = 30m: beta_k = 1.0
-    d_0:  float = 20.0   # path loss reference distance [m]
-
-    # CU distances: Uniform[d_cu_min, d_cu_max] from BS
-    d_cu_min: float = 40.0   # min CU distance [m]
-    d_cu_max: float = 60.0   # max CU distance [m]
-
-    # Eve: physical distance and restricted angle sector
-    d_be: float = 20.0   # Eve physical distance [m]
-			 # Closer to BS than all CUs 
-                                
-    theta_E_min: float = 0.0  # Eve angle min [deg]
-    theta_E_max: float = 60.0  # Eve angle max [deg]
+    P_t:      float = 1.0   # total transmit power [W]
+    sigma2_C: float = 1.0   # CU noise variance (0 dBm normalised)
+    sigma2_e: float = 1.0   # Eve noise variance
+    rho:      float = 0.5   # power split ratio (data / AN)
+    L:        int   = 64    # frame length (paper Section VII)
 
     # ----------------------------------------------------------------
-    # Communication stage  (paper Table I)
+    # Simulation
     # ----------------------------------------------------------------
-    sigma2_C:   float = 1.0    # comm noise variance (normalised)
-    rho:        float = 0.5    # power split ratio  (data / AN)
-    eve_snr_dB: float = 20.0   # fixed Eve SNR [dB]
+    n_trials: int = 10000
+    seed:     int = 42
 
-    # ----------------------------------------------------------------
-    # Simulation SNR range  (paper Table I)
-    # ----------------------------------------------------------------
-    snr_min_dB: float = 0.0
-    snr_max_dB: float = 20.0
-    n_snr_pts:  int   = 9
-    n_trials:   int   = 10000
-
-    # ----------------------------------------------------------------
-    # Secrecy outage threshold  (lab paper: R0 = 1 bps/Hz)
-    # ----------------------------------------------------------------
-    R0: float = 1.0   # target secrecy rate threshold [bps/Hz]
-
-    # ----------------------------------------------------------------
-    # Dataset generation  (paper: 10^6 training samples)
-    # ----------------------------------------------------------------
-    num_samples: int = 1_000_000
-    seed:        int = 42
-
-    # ----------------------------------------------------------------
-    # Model architecture  (paper Table I)
-    # ----------------------------------------------------------------
-    embed_dim:  int   = 128
-    num_heads:  int   = 4
-    num_layers: int   = 2
-    ff_dim:     int   = 256
-    dropout:    float = 0.1
-
-    # Cardinality regularizer weight
-    card_weight: float = 0.1
-
-    # ----------------------------------------------------------------
-    # Training  (paper Table I)
-    # ----------------------------------------------------------------
-    num_epochs:    int   = 50
-    learning_rate: float = 1e-3
-    weight_decay:  float = 1e-4
-    batch_size:    int   = 256
-    val_split:     float = 0.1
-    device:        str   = "auto"
 
     # ----------------------------------------------------------------
     # Paths
@@ -128,91 +74,50 @@ class SystemConfig:
     # ----------------------------------------------------------------
 
     @property
-    def local_dim(self) -> int:
-        """Per-user feature: [Re(h_k), Im(h_k)] in R^{2M}."""
-        return 2 * self.M
-
-    @property
-    def global_dim(self) -> int:
-        """Global feature: [theta_hat, CRB, mu, sigma_h^2, rho, SNR]."""
-        return 6
-
-    @property
-    def time_frac(self) -> float:
-        """Communication time fraction (T_c/T = 1.0)."""
-        return 1.0
-
-    @property
-    def P_s(self) -> float:
-        """Sensing transmit power [W]."""
-        return 10 ** ((self.P_s_dBm - 30.0) / 10.0)
-
-    @property
-    def sigma2_s(self) -> float:
-        """Sensing noise variance [W]."""
-        return 10 ** ((self.sigma2_dBm - 30.0) / 10.0)
-
-    @property
-    def eve_snr_linear(self) -> float:
-        """Eve SNR linear."""
-        return 10 ** (self.eve_snr_dB / 10.0)
-
-    @property
-    def beta_e_mag(self) -> float:
-        """|beta_e| = sqrt(eve_snr * sigma_C^2)."""
-        import math
-        return math.sqrt(self.eve_snr_linear * self.sigma2_C)
-
-    @property
     def theta_E_min_rad(self) -> float:
         """Eve min angle [rad]."""
-        import math
-        return math.radians(self.theta_E_min)
+        return float(np.radians(self.theta_E_min_deg))
 
     @property
     def theta_E_max_rad(self) -> float:
         """Eve max angle [rad]."""
-        import math
-        return math.radians(self.theta_E_max)
+        return float(np.radians(self.theta_E_max_deg))
 
     def summary(self) -> str:
-        """Print-friendly parameter summary."""
         lines = [
             "=" * 60,
-            "  SystemConfig  (paper Table I)",
+            "  SystemConfig  (CAML paper — Su et al.)",
             "=" * 60,
-            f"  Antennas   : M={self.M}, M_r={self.M_r}",
-            f"  Users      : N={self.N}, Kd={self.Kd}",
-            f"  Sensing    : L={self.L}, "
-            f"P_s={self.P_s_dBm} dBm, "
-            f"sigma2={self.sigma2_dBm} dBm",
-            f"               epsilon={self.epsilon_dBsm} dBsm",
-            f"  Channel    : eta={self.eta}",
-            f"               beta_k=(d_0/d_k)^eta, "
-            f"d_0={self.d_0}m",
-            f"               d_CU ~ Uniform[{self.d_cu_min}, "
-            f"{self.d_cu_max}]m",
-            f"               d_Eve = {self.d_be}m  "
-            f"(outside CU zone)",
-            f"               theta_E ~ Uniform["
-            f"{self.theta_E_min}°, {self.theta_E_max}°]",
-            f"  Comm       : rho={self.rho}, "
-            f"sigma2_C={self.sigma2_C}",
-            f"               Eve SNR = {self.eve_snr_dB} dB",
-            f"  Outage     : R0 = {self.R0} bps/Hz",
-            f"  SNR range  : [{self.snr_min_dB}, "
-            f"{self.snr_max_dB}] dB "
-            f"({self.n_snr_pts} pts)",
-            f"  Features   : local_dim={self.local_dim}, "
-            f"global_dim={self.global_dim}",
-            f"  Model      : embed={self.embed_dim}, "
-            f"heads={self.num_heads}, "
-            f"layers={self.num_layers}",
-            f"  Training   : epochs={self.num_epochs}, "
-            f"lr={self.learning_rate}, "
-            f"bs={self.batch_size}",
-            f"  Samples    : {self.num_samples:,}",
-            f"  Trials     : {self.n_trials}",
+            f"  Antennas   : N_t={self.N_t}, N_r={self.N_r}",
+            f"  Users      : N={self.N}, K={self.K}",
+            f"  Channel    : kappa={self.kappa}, L_p={self.L_p}",
+            f"               sigma_alpha={self.sigma_alpha}",
+            f"               theta_E ~ Uniform[{self.theta_E_min_deg}°, {self.theta_E_max_deg}°]",
+            f"  Signal     : P_t={self.P_t}, rho={self.rho}, L={self.L}",
+            f"               sigma2_C={self.sigma2_C}, sigma2_e={self.sigma2_e}",
+            f"  Simulation : trials={self.n_trials}, seed={self.seed}",
             "=" * 60,
         ]
         return "\n".join(lines)
+
+
+@dataclass
+class GFlowNetConfig:
+    # ----------------------------------------------------------------
+    # GFlowNet  (to be updated after full discussion)
+    # ----------------------------------------------------------------
+    N:            int   = 10       # total CUs (must match SystemConfig.N)
+    K:            int   = 2        # users to schedule (must match SystemConfig.K)
+    hidden:       int   = 256      # hidden layer size
+    lr:           float = 1e-3     # learning rate
+    temp_start:   float = 2.0      # initial temperature
+    temp_end:     float = 0.1      # final temperature
+    n_episodes:   int   = 50_000   # episodes for initial testing
+    reward_floor: float = 1e-8     # minimum reward to avoid log(0)
+    log_every:    int   = 1_000    # print interval
+
+if __name__ == "__main__":
+    cfg     = SystemConfig()
+    gfn_cfg = GFlowNetConfig()
+    print(cfg.summary())
+    print(f"\nGFlowNetConfig: N={gfn_cfg.N}, K={gfn_cfg.K}, episodes={gfn_cfg.n_episodes}")

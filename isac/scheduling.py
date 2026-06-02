@@ -96,6 +96,7 @@ def oracle_scheduling_genie(
     g_e:      NDArray[np.complexfloating],
     Kd:       int,
     P_t:      float,
+    sigma2_e: float,
     sigma2_C: float,
     time_frac: float,
     alpha:    float = 0.5,
@@ -136,6 +137,7 @@ def oracle_scheduling_genie(
             sched_idx = sched_idx,
             g_hat_e   = g_e,        # ← genie: perfect AN direction
             P_t       = P_t,
+            sigma2_e  = sigma2_e,
             sigma2_C  = sigma2_C,
             time_frac = time_frac,
             rho       = alpha,
@@ -157,6 +159,7 @@ def oracle_scheduling_label(
     Kd:       int,
     g_hat_e:  NDArray[np.complexfloating],
     P_t:      float,
+    sigma2_e: float,
     sigma2_C: float,
     time_frac: float,
     alpha:    float = 0.5,
@@ -167,8 +170,8 @@ def oracle_scheduling_label(
     do at inference time. Uses TRUE g_e only for honest evaluation.
 
     Train/test consistency:
-        Label oracle  → g_hat_e for AN  (matches DL inference) ✅
-        DL inference  → g_hat_e for AN                         ✅
+        Label oracle  → g_hat_e for AN  (matches DL inference) 
+        DL inference  → g_hat_e for AN                         
 
     If g_e were used for AN here, the model would learn scheduling
     decisions that are optimal under perfect CSI but suboptimal under
@@ -201,6 +204,7 @@ def oracle_scheduling_label(
             sched_idx = sched_idx,
             g_hat_e   = g_hat_e,    # ← estimated: consistent with DL inference
             P_t       = P_t,
+            sigma2_e  = sigma2_e,
             sigma2_C  = sigma2_C,
             time_frac = time_frac,
             rho       = alpha,

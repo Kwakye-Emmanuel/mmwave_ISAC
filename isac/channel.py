@@ -4,7 +4,6 @@ import numpy as np
 from numpy.random import Generator
 from numpy.typing import NDArray
 
-from .sensing import ula_steering
 from .config import SystemConfig
 
 cfg = SystemConfig()
@@ -76,24 +75,25 @@ def generate_eve_angle(
 # Eve channel
 # ---------------------------------------------------------------------------
 def generate_eve_channel(
-    M:          int   = cfg.M,
-    theta_E:    float = 0.0,
-    beta_e_mag: float = cfg.beta_e_mag,
-    rng:        Generator | None = None,
+    M:       int   = cfg.M,
+    theta_E: float = 0.0,
+    sigma_e: float = cfg.sigma_e,
+    rng:     Generator | None = None,
 ) -> NDArray[np.complexfloating]:
-    """Generate LoS Eve channel.
+    """Generate Eve channel with random complex Gaussian coefficient.
 
-    g_e = beta_e * a(theta_E)
-    |beta_e| = sqrt(eve_snr * sigma_C^2)
-    Eve SNR = 20dB → |beta_e| = sqrt(100) = 10.0
-    Random phase: beta_e = |beta_e| * exp(j*phi)
+    g_e = alpha_e * a(theta_E)
+    alpha_e ~ CN(0, sigma_e^2)
+    where sigma_e = sqrt(eve_snr * sigma_C^2)
+    Eve SNR = 20dB → sigma_e = sqrt(100) = 10.0
     """
     if rng is None:
         rng = np.random.default_rng()
-    beta_e = beta_e_mag * np.exp(
-        1j * rng.uniform(0.0, 2.0 * np.pi)
-    )
-    return beta_e * ula_steering(theta_E, M)
+    alpha_e = (
+        rng.standard_normal() +
+        1j * rng.standard_normal()
+    ) / np.sqrt(2.0) * sigma_e
+    return alpha_e * ula_steering(theta_E, M)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ def generate_channels(
     eta:         float = cfg.eta,
     d_cu_min:    float = cfg.d_cu_min,
     d_cu_max:    float = cfg.d_cu_max,
-    beta_e_mag:  float = cfg.beta_e_mag,
+    sigma_e:     float = cfg.sigma_e,
     theta_E_min: float = cfg.theta_E_min_rad,
     theta_E_max: float = cfg.theta_E_max_rad,
     seed:        int | None = None,
@@ -125,7 +125,7 @@ def generate_channels(
         rng   = rng,
     )
 
-    g_e = generate_eve_channel(M, theta_E, beta_e_mag, rng)
+    g_e = generate_eve_channel(M, theta_E, sigma_e, rng)
 
     return {
         "H":       H,
@@ -147,7 +147,7 @@ def generate_dataset(
     eta:          float = cfg.eta,
     d_cu_min:     float = cfg.d_cu_min,
     d_cu_max:     float = cfg.d_cu_max,
-    beta_e_mag:   float = cfg.beta_e_mag,
+    sigma_e:      float = cfg.sigma_e,
     theta_E_min:  float = cfg.theta_E_min_rad,
     theta_E_max:  float = cfg.theta_E_max_rad,
     seed:         int   = cfg.seed,
@@ -162,7 +162,7 @@ def generate_dataset(
             eta         = eta,
             d_cu_min    = d_cu_min,
             d_cu_max    = d_cu_max,
-            beta_e_mag  = beta_e_mag,
+            sigma_e     = sigma_e,
             theta_E_min = theta_E_min,
             theta_E_max = theta_E_max,
             seed        = seed + i,

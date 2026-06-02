@@ -43,7 +43,7 @@ from .scheduling import oracle_scheduling_label
 # ---------------------------------------------------------------------------
 
 def extract_local_features(H: np.ndarray) -> np.ndarray:
-    """Per-user local features (paper eq. local).
+    """Per-user local features (paper eq. 13).
 
     v_k^local = [Re(h_k)^T, Im(h_k)^T]^T  in R^{2M}
 
@@ -68,17 +68,17 @@ def extract_global_features(
     snr_db:    float,
     sigma2_C:  float = 1.0,
 ) -> np.ndarray:
-    """Global feature vector (paper eq. global).
+    """Global feature vector (paper eq. 14).
 
-    v^global = [theta_hat_E, CRB(theta_E), mu, sigma_h^2, rho, P_t/sigma_C^2]
+    v^global = [theta_hat_E, CRB(theta_E), mu, sigma_h^2, rho, snr_lin]
 
     Args:
         theta_hat : MLE angle estimate [radians]
         crb       : CRB(theta_E) [radians^2]
         H         : (M, N) user channel matrix
-        rho       : power split ratio
+        rho       : power split ratio phi
         snr_db    : communication SNR [dB]
-        sigma2_C  : comm noise variance
+        sigma2_C  : comm noise variance (unused — snr_lin computed from snr_db)
     Returns:
         global_ : (6,) float32
     """
@@ -117,7 +117,7 @@ def generate_sample(
         P_t        : comm transmit power [W]
         snr_db     : comm SNR [dB]
         seed       : random seed
-        beta_s_mag : |beta_s| round-trip gain
+        beta_s_mag : |beta_s| round-trip gain magnitude
     Returns:
         local   : (N, 2*M)
         global_ : (6,)
@@ -125,16 +125,16 @@ def generate_sample(
     """
     rng = np.random.default_rng(seed)
 
-    # 1. Channel — d_0 for path loss, d_be for Eve channel
+    # 1. Channel — d_0 for path loss reference, sigma_e for Eve gain
     sample = generate_channels(
         M           = cfg.M,
         N           = cfg.N,
-        d_0         = cfg.d_0,           # ← path loss reference 
-        d_be        = cfg.d_be,          # ← Eve physical distance 
+        d_0         = cfg.d_0,
+        d_be        = cfg.d_be,
         eta         = cfg.eta,
         d_cu_min    = cfg.d_cu_min,
         d_cu_max    = cfg.d_cu_max,
-        beta_e_mag  = cfg.beta_e_mag,
+        sigma_e     = cfg.sigma_e,        # ← correct: CN(0, sigma_e^2)
         theta_E_min = cfg.theta_E_min_rad,
         theta_E_max = cfg.theta_E_max_rad,
         seed        = seed,
@@ -143,23 +143,23 @@ def generate_sample(
         sample["H"], sample["g_e"], sample["theta_E"]
     )
 
-    # 2. Sensing — uses d_be (Eve physical distance)
+    # 2. Sensing — random phase on round-trip path gain
     beta_s_t = beta_s_mag * np.exp(
         1j * rng.uniform(0, 2 * np.pi)
     )
-    state    = run_sensing(
+    state = run_sensing(
         theta_E, cfg.M, cfg.M_r, cfg.L,
         cfg.P_s, cfg.sigma2_s, beta_s_t,
         seed=seed,
     )
     theta_hat = state["theta_hat"]
     crb       = state["crb"]
-    g_hat_e   = state["at_hat"] * cfg.beta_e_mag
+    g_hat_e   = cfg.sigma_e * state["at_hat"]  # Coarse Eve CSI estimate: expected path loss × estimated steering vector
 
-    # 3. Oracle label
+    # 3. Oracle label — uses g_hat_e for AN (train/test consistent)
     label, _ = oracle_scheduling_label(
         H, g_e, cfg.Kd, g_hat_e,
-        P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho,
+        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho,
     )
 
     # 4. Features
@@ -201,9 +201,9 @@ def generate_training_dataset(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Sensing path gain uses Eve physical distance d_be
+    # Sensing path gain — uses Eve physical distance d_be
     beta_s_mag = compute_beta_s(
-        cfg.d_be,           # ← Eve physical distance 
+        cfg.d_be,
         cfg.f_c,
         cfg.epsilon_dBsm,
     )

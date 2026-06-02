@@ -30,7 +30,7 @@ def _run_single_trial(t, s_idx, snr, cfg, beta_s_mag):
     sample = generate_channels(
         M=cfg.M, N=cfg.N, d_0=cfg.d_0, d_be=cfg.d_be,
         eta=cfg.eta, d_cu_min=cfg.d_cu_min, d_cu_max=cfg.d_cu_max,
-        beta_e_mag=cfg.beta_e_mag,
+        sigma_e=cfg.sigma_e,
         theta_E_min=cfg.theta_E_min_rad,
         theta_E_max=cfg.theta_E_max_rad,
         seed=trial_seed,
@@ -42,18 +42,26 @@ def _run_single_trial(t, s_idx, snr, cfg, beta_s_mag):
         theta_E, cfg.M, cfg.M_r, cfg.L,
         cfg.P_s, cfg.sigma2_s, beta_s_t, seed=trial_seed,
     )
-    g_hat_e = state["at_hat"] * cfg.beta_e_mag
+    # Coarse Eve CSI estimate: E[|alpha_e|] * a(theta_hat_e)
+    # Since alpha_e ~ CN(0, sigma_e^2), we use sigma_e as the
+    # expected amplitude. Direction from MLE sensing estimate.
+    # Ref: E[|alpha_e|^2] = sigma_e^2 = (d_0/d_be)^eta
+    g_hat_e = cfg.sigma_e * state["at_hat"]  # Coarse Eve CSI estimate: expected path loss × estimated steering vector
 
-    sched_B1 = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
-    r_B1     = compute_secrecy_sum_rate(
-        H, g_e, sched_B1, None, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+    # B1 and B2 share the same random scheduling — only AN design differs
+    sched_rand = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
 
-    sched_B2 = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
-    r_B2     = compute_secrecy_sum_rate(
-        H, g_e, sched_B2, g_hat_e, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+    r_B1 = compute_secrecy_sum_rate(
+        H, g_e, sched_rand, None,
+        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+
+    r_B2 = compute_secrecy_sum_rate(
+        H, g_e, sched_rand, g_hat_e,
+        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
     _, r_ora = oracle_scheduling_genie(
-        H, g_e, cfg.Kd, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+        H, g_e, cfg.Kd, P_t,
+        cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
     return r_B1, r_B2, r_ora
 
@@ -69,8 +77,6 @@ def simulate_rsec_vs_snr(cfg: SystemConfig | None = None) -> tuple:
     beta_s_mag = compute_beta_s(cfg.d_be, cfg.f_c, cfg.epsilon_dBsm)
     snr_db     = np.linspace(cfg.snr_min_dB, cfg.snr_max_dB, cfg.n_snr_pts)
 
-    #rsec_B1 = rsec_B2 = rsec_oracle = np.zeros(len(snr_db))
-    #pout_B1 = pout_B2 = pout_oracle = np.zeros(len(snr_db))
     rsec_B1     = np.zeros(len(snr_db))
     rsec_B2     = np.zeros(len(snr_db))
     rsec_oracle = np.zeros(len(snr_db))
@@ -87,7 +93,7 @@ def simulate_rsec_vs_snr(cfg: SystemConfig | None = None) -> tuple:
             delayed(_run_single_trial)(t, s_idx, snr, cfg, beta_s_mag)
             for t in range(cfg.n_trials)
         )
-        res_np  = np.array(results)
+        res_np        = np.array(results)
         r_B1, r_B2, r_ora = res_np[:, 0], res_np[:, 1], res_np[:, 2]
 
         rsec_B1[s_idx]     = np.mean(r_B1)
@@ -104,7 +110,7 @@ def simulate_rsec_vs_snr(cfg: SystemConfig | None = None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# IEEE-quality rcParams (shared)
+# rcParams
 # ---------------------------------------------------------------------------
 
 def _apply_rcparams():
@@ -134,14 +140,6 @@ def _topology_tag(cfg):
     return (f"_Eve{cfg.eve_snr_dB:.0f}dB"
             f"_dbe{cfg.d_be:.0f}m"
             f"_CU{cfg.d_cu_min:.0f}-{cfg.d_cu_max:.0f}m")
-
-
-#def _save(fig, save_path, tag_key):
-    #if save_path:
-        #os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        #ext = save_path.split(".")[-1]
-        #fig.savefig(save_path, dpi=300, bbox_inches="tight", format=ext)
-        #print(f"\n  Saved -> {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -182,20 +180,20 @@ def plot_rsec_vs_snr(
                 color="#228B22", linestyle="-", marker="D",
                 markerfacecolor="none", markeredgecolor="#228B22",
                 markeredgewidth=mw, markersize=ms,
-                label="DL Sched. (No Sensing AN)")
+                label="DL Sched. (Isotropic AN)")
 
     ax.plot(snr_db, rsec_B2,
             color="black", linestyle="--", marker="s",
             markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-            label="Sensing-Assisted, Random Sched.")
+            label="RS + Directed AN (B2)")
 
     ax.plot(snr_db, rsec_B1,
             color="black", linestyle="-", marker="o",
             markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-            label="Conventional BF, Random Sched.")
+            label="RS + Isotropic AN (B1)")
 
-    ax.set_xlabel("SNR (dB)", fontsize=11)
-    ax.set_ylabel("Secrecy Sum-Rate (bits/s/Hz)", fontsize=11)
+    ax.set_xlabel("SNR, $\\rho_t$ (dB)", fontsize=11)
+    ax.set_ylabel("Ergodic Secrecy Sum-Rate (bps/Hz)", fontsize=11)
     ax.set_xlim(left=snr_db[0], right=snr_db[-1])
     ax.set_ylim(bottom=0)
     ax.margins(0)
@@ -231,7 +229,6 @@ def plot_outage_vs_snr(
     fig, ax = plt.subplots(figsize=(6.5, 5.0))
     ms, mw  = 7, 1.5
 
-    floor = 1.0 / cfg.n_trials
     def mask(arr):
         out = arr.copy().astype(float)
         out[out == 0.0] = np.nan
@@ -253,19 +250,19 @@ def plot_outage_vs_snr(
                     color="#228B22", linestyle="-", marker="D",
                     markerfacecolor="none", markeredgecolor="#228B22",
                     markeredgewidth=mw, markersize=ms,
-                    label="DL Sched. (No Sensing AN)")
+                    label="DL Sched. (Isotropic AN)")
 
     ax.semilogy(snr_db, mask(pout_B2),
                 color="black", linestyle="--", marker="s",
                 markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-                label="Sensing-Assisted, Random Sched.")
+                label="RS + Directed AN (B2)")
 
     ax.semilogy(snr_db, mask(pout_B1),
                 color="black", linestyle="-", marker="o",
                 markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-                label="Conventional BF, Random Sched.")
+                label="RS + Isotropic AN (B1)")
 
-    ax.set_xlabel("SNR (dB)", fontsize=11)
+    ax.set_xlabel("SNR, $\\rho_t$ (dB)", fontsize=11)
     ax.set_ylabel("Secrecy Outage Probability", fontsize=11)
     ax.set_xlim(left=snr_db[0], right=snr_db[-1])
     ax.set_ylim(bottom=1e-4, top=1.5)
