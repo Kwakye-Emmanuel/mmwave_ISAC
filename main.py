@@ -97,6 +97,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     from isac.dataset import generate_training_dataset, create_data_loaders, ISACDataset
     from isac.models import SetTransformerScheduler, DeepSetsScheduler
     from isac.trainer import Trainer
+    from isac.simulate import _topology_tag
 
     cfg = SystemConfig(
         num_epochs    = args.epochs,
@@ -114,7 +115,11 @@ def cmd_train(args: argparse.Namespace) -> None:
     print(f"\n  Device : {device}\n")
 
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    data_path = cfg.data_dir / f"dataset_N{cfg.N}_Kd{cfg.Kd}_M{cfg.M}.npz"
+
+    # Tag dataset and checkpoint with topology
+    tag       = _topology_tag(cfg)
+    data_path = cfg.data_dir / \
+        f"dataset_N{cfg.N}_Kd{cfg.Kd}_M{cfg.M}{tag}.npz"
 
     if not data_path.exists() or args.regenerate:
         print(f"  Generating {cfg.num_samples:,} training samples ...")
@@ -146,7 +151,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             ff_dim     = cfg.ff_dim,
             dropout    = cfg.dropout,
         )
-        model_name = "isac_set_transformer"
+        model_name = f"isac_set_transformer{tag}"
     else:
         model = DeepSetsScheduler(
             local_dim  = ds.local_dim,
@@ -155,14 +160,18 @@ def cmd_train(args: argparse.Namespace) -> None:
             hidden_dim = cfg.ff_dim,
             dropout    = cfg.dropout,
         )
-        model_name = "isac_deep_sets"
+        model_name = f"isac_deep_sets{tag}"
 
     total = sum(p.numel() for p in model.parameters())
     print(f"  Architecture : {arch}")
-    print(f"  Parameters   : {total:,}\n")
+    print(f"  Parameters   : {total:,}")
+    print(f"  Model name   : {model_name}\n")
 
-    trainer = Trainer(model, train_loader, val_loader, cfg, Kd=cfg.Kd, device=device)
-    result  = trainer.train(model_name=model_name)
+    trainer = Trainer(
+        model, train_loader, val_loader,
+        cfg, Kd=cfg.Kd, device=device
+    )
+    result = trainer.train(model_name=model_name)
     print(f"\n  Best checkpoint : {result.model_path}")
 
 
@@ -171,9 +180,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _eval_trial_cpu(t, s_idx, snr, cfg, beta_s_mag):
-    """CPU-bound trial: channel gen + sensing + B1/B2/Oracle.
-    Returns (H, g_e, g_hat_e, state, r_B1, r_B2, r_ora).
-    """
+    """CPU-bound trial: channel gen + sensing + B1/B2/Oracle."""
     import numpy as np
     from isac.channel import generate_channels
     from isac.sensing import run_sensing
@@ -187,7 +194,7 @@ def _eval_trial_cpu(t, s_idx, snr, cfg, beta_s_mag):
     sample = generate_channels(
         M=cfg.M, N=cfg.N, d_0=cfg.d_0, d_be=cfg.d_be,
         eta=cfg.eta, d_cu_min=cfg.d_cu_min, d_cu_max=cfg.d_cu_max,
-        beta_e_mag=cfg.beta_e_mag,
+        sigma_e=cfg.sigma_e,
         theta_E_min=cfg.theta_E_min_rad,
         theta_E_max=cfg.theta_E_max_rad,
         seed=seed_t,
@@ -199,18 +206,22 @@ def _eval_trial_cpu(t, s_idx, snr, cfg, beta_s_mag):
         theta_E, cfg.M, cfg.M_r, cfg.L,
         cfg.P_s, cfg.sigma2_s, beta_s_t, seed=seed_t,
     )
-    g_hat_e = state["at_hat"] * cfg.beta_e_mag
+    g_hat_e = state["beta_hat"] * state["at_hat"]
 
-    s_B1 = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
+    # B1 and B2 share the same random scheduling — only AN design differs
+    sched_rand = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
+
     r_B1 = compute_secrecy_sum_rate(
-        H, g_e, s_B1, None, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+        H, g_e, sched_rand, None,
+        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
-    s_B2 = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
     r_B2 = compute_secrecy_sum_rate(
-        H, g_e, s_B2, g_hat_e, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+        H, g_e, sched_rand, g_hat_e,
+        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
     _, r_ora = oracle_scheduling_genie(
-        H, g_e, cfg.Kd, P_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+        H, g_e, cfg.Kd, P_t,
+        cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
     return H, g_e, g_hat_e, state, r_B1, r_B2, r_ora, P_t
 
@@ -294,14 +305,13 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     pout_proposed = np.zeros(len(snr_db))
     pout_conv_dl  = np.zeros(len(snr_db))
 
-    hdr = f"  {'SNR':>6} | {'B1':>8} | {'B2':>8} | {'Oracle':>8} | {'Conv+DL':>9} | {'Proposed':>10}"
+    hdr = f"  {'SNR':>6} | {'B1':>8} | {'B2':>8} | {'Oracle':>8} | {'B3(DL)':>9} | {'Proposed':>10}"
     if model_ds is not None:
         hdr += f" | {'DeepSets':>10}"
     print(hdr)
     print("  " + "-" * len(hdr.lstrip()))
 
     def model_sched(model, H, state, snr):
-        """Serial GPU inference — PyTorch handles its own threading."""
         loc = extract_local_features(H)
         glb = extract_global_features(
             state["theta_hat"], state["crb"], H, cfg.rho, snr, cfg.sigma2_C)
@@ -314,34 +324,37 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     for s, snr in enumerate(snr_db):
         P_t = 10 ** (snr / 10.0) * cfg.sigma2_C
 
-        # Step 1 — Parallel CPU: channel gen + sensing + B1/B2/Oracle
         cpu_results = Parallel(n_jobs=-1)(
             delayed(_eval_trial_cpu)(t, s, snr, cfg, beta_s_mag)
             for t in range(n_trials)
         )
 
-        # Step 2 — Serial GPU: model inference on pre-generated channels
         a_B1 = a_B2 = a_ora = a_cdl = a_st = a_ds = 0.0
         o_B1 = o_B2 = o_ora = o_cdl = o_st = 0.0
 
         for H, g_e, g_hat_e, state, r_B1, r_B2, r_ora, P_t_t in cpu_results:
-            a_B1 += r_B1;  o_B1 += float(r_B1 < cfg.R0)
-            a_B2 += r_B2;  o_B2 += float(r_B2 < cfg.R0)
-            a_ora += r_ora; o_ora += float(r_ora < cfg.R0)
+            a_B1  += r_B1;  o_B1  += float(r_B1  < cfg.R0)
+            a_B2  += r_B2;  o_B2  += float(r_B2  < cfg.R0)
+            a_ora += r_ora; o_ora += float(r_ora  < cfg.R0)
 
+            # Proposed: DL scheduling + directed AN
             s_st = model_sched(model_st, H, state, snr)
             r_st = compute_secrecy_sum_rate(
-                H, g_e, s_st, g_hat_e, P_t_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
-            a_st += r_st;  o_st += float(r_st < cfg.R0)
+                H, g_e, s_st, g_hat_e,
+                P_t_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+            a_st += r_st; o_st += float(r_st < cfg.R0)
 
+            # B3: DL scheduling + isotropic AN
             r_cdl = compute_secrecy_sum_rate(
-                H, g_e, s_st, None, P_t_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+                H, g_e, s_st, None,
+                P_t_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
             a_cdl += r_cdl; o_cdl += float(r_cdl < cfg.R0)
 
             if model_ds is not None:
                 s_ds  = model_sched(model_ds, H, state, snr)
                 a_ds += compute_secrecy_sum_rate(
-                    H, g_e, s_ds, g_hat_e, P_t_t, cfg.sigma2_C, cfg.time_frac, cfg.rho)
+                    H, g_e, s_ds, g_hat_e,
+                    P_t_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
 
         rsec_B1[s]       = a_B1  / n_trials
         rsec_B2[s]       = a_B2  / n_trials
@@ -365,7 +378,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         print(row)
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Save raw results for future replotting
     tag = _topology_tag(cfg)
     np.savez(
@@ -382,11 +395,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         pout_B2       = pout_B2,
         pout_oracle   = pout_oracle,
         pout_proposed = pout_proposed,
-        pout_conv_dl  = pout_conv_dl,  
+        pout_conv_dl  = pout_conv_dl,
     )
     print(f"  Results saved -> eval_results{tag}.npz")
-    
-    
+
     def nan_zeros(arr):
         out = arr.copy().astype(float)
         out[out == 0.0] = np.nan

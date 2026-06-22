@@ -1,0 +1,26 @@
+nohup: ignoring input
+
+  Loading outputs/eval_results_Eve20dB_dbe20m_CU40-60m.npz ...
+  SNR points : [ 0.   2.5  5.   7.5 10.  12.5 15.  17.5 20. ]
+  pout_oracle (before) : [9.76713e-01 2.60902e-01 3.24000e-04 0.00000e+00 0.00000e+00 0.00000e+00
+ 0.00000e+00 0.00000e+00 0.00000e+00]
+
+  Running 10,000,000 trials at SNR=5.0dB (index=2) ...
+  SNR=5.0dB | Genie pout = 3.336e-04
+  Updated pout_oracle[2] = 3.336e-04
+
+  Running 10,000,000 trials at SNR=7.5dB (index=3) ...
+  SNR=7.5dB | Genie pout = 0.000e+00
+  Still zero at 10,000,000 trials — keeping original
+
+  pout_oracle (after) : [9.76713e-01 2.60902e-01 3.33600e-04 0.00000e+00 0.00000e+00 0.00000e+00
+ 0.00000e+00 0.00000e+00 0.00000e+00]
+
+  Resaved -> outputs/eval_results_Eve20dB_dbe20m_CU40-60m.npz
+
+  Saved -> outputs/replot_outage_vs_snr_Eve20dB_dbe20m_CU40-60m_Eve20dB_dbe20m_CU40-60m.png
+
+  Saved -> outputs/replot_outage_vs_snr_Eve20dB_dbe20m_CU40-60m_Eve20dB_dbe20m_CU40-60m.pdf
+  Replotted -> replot_outage_vs_snr_Eve20dB_dbe20m_CU40-60m.pdf
+
+  Done.

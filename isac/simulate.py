@@ -1,319 +1,284 @@
-"""Monte Carlo simulation for ISAC-aided physical layer security (Parallel Version)."""
+"""simulate.py — Secrecy sum-rate vs P0 sweep.
+
+Evaluates 4 scheduling/beamforming schemes across P0 range.
+Saves plot to outputs/ and raw results to outputs/results.npz.
+
+Schemes:
+    1. Proposed       — GFlowNet + directed AN
+    2. GFlownet iso AN     — GFlowNet + isotropic AN
+    3. RS dir AN      — random scheduling + directed AN
+    4. RS iso AN      — random scheduling + isotropic AN
+"""
 from __future__ import annotations
 
-import os
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from numpy.typing import NDArray
-from joblib import Parallel, delayed
+import matplotlib.ticker as ticker
+from pathlib import Path
+import torch
 
-from .channel import generate_channels
-from .config import SystemConfig
-from .sensing import compute_beta_s, run_sensing
-from .signal import compute_secrecy_sum_rate
-from .scheduling import (
-    random_scheduling,
-    oracle_scheduling_genie,
-    mask_to_indices,
-)
+from config import SystemConfig, GFlowNetConfig
+from channel_mmwave import generate_channels_mmwave
+from gflownet import GFlowNet, build_features, compute_reward
+from sensing import run_sensing
 
 
-# ---------------------------------------------------------------------------
-# Parallel worker
-# ---------------------------------------------------------------------------
-
-def _run_single_trial(t, s_idx, snr, cfg, beta_s_mag):
-    trial_seed = cfg.seed + t + s_idx * 100_000
-    rng        = np.random.default_rng(trial_seed)
-    P_t        = 10 ** (snr / 10.0) * cfg.sigma2_C
-
-    sample = generate_channels(
-        M=cfg.M, N=cfg.N, d_0=cfg.d_0, d_be=cfg.d_be,
-        eta=cfg.eta, d_cu_min=cfg.d_cu_min, d_cu_max=cfg.d_cu_max,
-        sigma_e=cfg.sigma_e,
-        theta_E_min=cfg.theta_E_min_rad,
-        theta_E_max=cfg.theta_E_max_rad,
-        seed=trial_seed,
-    )
-    H, g_e, theta_E = sample["H"], sample["g_e"], sample["theta_E"]
-
-    beta_s_t = beta_s_mag * np.exp(1j * rng.uniform(0, 2 * np.pi))
-    state    = run_sensing(
-        theta_E, cfg.M, cfg.M_r, cfg.L,
-        cfg.P_s, cfg.sigma2_s, beta_s_t, seed=trial_seed,
-    )
-    # Coarse Eve CSI estimate: E[|alpha_e|] * a(theta_hat_e)
-    # Since alpha_e ~ CN(0, sigma_e^2), we use sigma_e as the
-    # expected amplitude. Direction from MLE sensing estimate.
-    # Ref: E[|alpha_e|^2] = sigma_e^2 = (d_0/d_be)^eta
-    g_hat_e = cfg.sigma_e * state["at_hat"]  # Coarse Eve CSI estimate: expected path loss × estimated steering vector
-
-    # B1 and B2 share the same random scheduling — only AN design differs
-    sched_rand = mask_to_indices(random_scheduling(cfg.N, cfg.Kd, rng))
-
-    r_B1 = compute_secrecy_sum_rate(
-        H, g_e, sched_rand, None,
-        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
-
-    r_B2 = compute_secrecy_sum_rate(
-        H, g_e, sched_rand, g_hat_e,
-        P_t, cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
-
-    _, r_ora = oracle_scheduling_genie(
-        H, g_e, cfg.Kd, P_t,
-        cfg.sigma2_e, cfg.sigma2_C, cfg.time_frac, cfg.rho)
-
-    return r_B1, r_B2, r_ora
+# ----------------------------------------------------------------
+# IEEE plot style
+# ----------------------------------------------------------------
+plt.rcParams.update({
+    "figure.facecolor":   "white",
+    "axes.facecolor":     "white",
+    "axes.grid":          True,
+    "grid.color":         "#cccccc",
+    "grid.linewidth":     0.6,
+    "grid.linestyle":     "--",
+    "axes.spines.top":    True,
+    "axes.spines.right":  True,
+    "axes.spines.left":   True,
+    "axes.spines.bottom": True,
+    "axes.linewidth":     0.8,
+    "font.family":        "serif",
+    "font.size":          12,
+    "axes.labelsize":     13,
+    "legend.fontsize":    11,
+    "xtick.labelsize":    11,
+    "ytick.labelsize":    11,
+    "lines.linewidth":    1.8,
+    "lines.markersize":   7,
+})
 
 
-# ---------------------------------------------------------------------------
-# Monte Carlo simulation
-# ---------------------------------------------------------------------------
+def run_simulation(
+    sys_cfg  : SystemConfig,
+    gfn_cfg  : GFlowNetConfig,
+    gfn      : GFlowNet,
+    rng      : np.random.Generator,
+) -> dict:
+    """Sweep P0 and evaluate all 4 schemes.
 
-def simulate_rsec_vs_snr(cfg: SystemConfig | None = None) -> tuple:
-    if cfg is None:
-        cfg = SystemConfig()
+    Returns dict of results arrays shape (n_P0_pts,).
+    """
+    n_pts = sys_cfg.n_P0_pts
 
-    beta_s_mag = compute_beta_s(cfg.d_be, cfg.f_c, cfg.epsilon_dBsm)
-    snr_db     = np.linspace(cfg.snr_min_dB, cfg.snr_max_dB, cfg.n_snr_pts)
+    results = {
+        "gfn_directed"   : np.zeros(n_pts),
+        "gfn_iso"    : np.zeros(n_pts),
+        "rs_dir"     : np.zeros(n_pts),
+        "rs_iso"     : np.zeros(n_pts),
+        "P0_dBm"     : sys_cfg.P0_dBm_range,
+    }
 
-    rsec_B1     = np.zeros(len(snr_db))
-    rsec_B2     = np.zeros(len(snr_db))
-    rsec_oracle = np.zeros(len(snr_db))
-    pout_B1     = np.zeros(len(snr_db))
-    pout_B2     = np.zeros(len(snr_db))
-    pout_oracle = np.zeros(len(snr_db))
+    for idx, (P0_dBm, P0) in enumerate(
+        zip(sys_cfg.P0_dBm_range, sys_cfg.P0_range)
+    ):
+        print(f"\n[P0 = {P0_dBm:.2f} dBm = {P0:.4f} W]")
 
-    print(f"  Trials : {cfg.n_trials}  |  SNR pts: {len(snr_db)}")
-    print(f"  {'SNR(dB)':>8} | {'B1':>10} | {'B2':>10} | {'Oracle':>10} |")
-    print("  " + "-" * 50)
+        gfn_dir_rates  =  []
+        gfn_iso_rates  = []
+        rs_dir_rates   = []
+        rs_iso_rates   = []
 
-    for s_idx, snr in enumerate(snr_db):
-        results = Parallel(n_jobs=-1)(
-            delayed(_run_single_trial)(t, s_idx, snr, cfg, beta_s_mag)
-            for t in range(cfg.n_trials)
-        )
-        res_np        = np.array(results)
-        r_B1, r_B2, r_ora = res_np[:, 0], res_np[:, 1], res_np[:, 2]
+        for trial in range(sys_cfg.n_trials):
 
-        rsec_B1[s_idx]     = np.mean(r_B1)
-        rsec_B2[s_idx]     = np.mean(r_B2)
-        rsec_oracle[s_idx] = np.mean(r_ora)
-        pout_B1[s_idx]     = np.mean(r_B1  < cfg.R0)
-        pout_B2[s_idx]     = np.mean(r_B2  < cfg.R0)
-        pout_oracle[s_idx] = np.mean(r_ora < cfg.R0)
+            # 1. channel realization
+            ch = generate_channels_mmwave(
+                N_t             = sys_cfg.N_t,
+                N               = sys_cfg.N,
+                kappa           = sys_cfg.kappa,
+                L_p             = sys_cfg.L_p,
+                sigma_alpha     = sys_cfg.sigma_alpha,
+                theta_E_min_deg = sys_cfg.theta_E_min_deg,
+                theta_E_max_deg = sys_cfg.theta_E_max_deg,
+                seed            = int(rng.integers(0, 2**31)),
+            )
+            H       = ch["H"]
 
-        print(f"  {snr:>+8.1f} | {rsec_B1[s_idx]:>10.4f} | "
-              f"{rsec_B2[s_idx]:>10.4f} | {rsec_oracle[s_idx]:>10.4f} |")
+            # 2. sensing — uses same P0 budget
+            beta = sys_cfg.beta_mag * np.exp(
+                1j * rng.uniform(0, 2 * np.pi)
+            )
+            sensing_state = run_sensing(
+                theta_E_deg = ch["theta_E"],
+                beta        = beta,
+                N_t         = sys_cfg.N_t,
+                N_r         = sys_cfg.N_r,
+                L           = sys_cfg.L,
+                P0          = P0,
+                sigma2_R    = sys_cfg.sigma2_R,
+                seed        = int(rng.integers(0, 2**31)),
+            )
 
-    return snr_db, rsec_B1, rsec_B2, rsec_oracle, pout_B1, pout_B2, pout_oracle
+            theta_hat = sensing_state["theta_hat"]
+            crb       = sensing_state["crb"]
+            g_e_hat   = sensing_state["g_e_hat"]
+
+            # build features for GFlowNet
+            user_feats_np, eve_ctx_np = build_features(
+                H, sensing_state, sys_cfg.N
+            )
+
+            # common reward kwargs
+            reward_kwargs = dict(
+                H         = H,
+                theta_hat = theta_hat,
+                crb       = crb,
+                P_t       = P0,
+                sys_cfg   = sys_cfg,
+                rng       = rng,
+                n_mc      = gfn_cfg.n_mc,
+            )
+
+            # ── Scheme 1: Proposed — GFlowNet + directed AN ──
+            selected_gfn = gfn.sample(
+                user_feats_np, eve_ctx_np, greedy=True
+            )
+            r1 = compute_reward(
+                selected_gfn,
+                an_type = "directed",
+                g_e_hat = g_e_hat,
+                **reward_kwargs,
+            )
+            gfn_dir_rates.append(r1)
+
+            # ── Scheme 2: DLS iso AN — GFlowNet + isotropic AN ──
+            r2 = compute_reward(
+                selected_gfn,
+                an_type = "isotropic",
+                **reward_kwargs,
+            )
+            gfn_iso_rates.append(r2)
+
+            # ── Scheme 3: RS dir AN — random + directed AN ──
+            selected_rand = tuple(
+                rng.choice(sys_cfg.N, sys_cfg.K, replace=False)
+            )
+            r3 = compute_reward(
+                selected_rand,
+                an_type = "directed",
+                g_e_hat = g_e_hat,
+                **reward_kwargs,
+            )
+            rs_dir_rates.append(r3)
+
+            # ── Scheme 4: RS iso AN — random + isotropic AN ──
+            r4 = compute_reward(
+                selected_rand,
+                an_type = "isotropic",
+                **reward_kwargs,
+            )
+            rs_iso_rates.append(r4)
+
+            if (trial + 1) % 100 == 0:
+                print(f"  trial {trial+1}/{sys_cfg.n_trials}  "
+                      f"proposed={np.mean(gfn_dir_rates):.3f}  "
+                      f"rs_iso={np.mean(rs_iso_rates):.3f}")
+
+        results["gfn_directed"][idx] = np.mean(gfn_dir_rates)
+        results["gfn_iso"][idx]  = np.mean(gfn_iso_rates)
+        results["rs_dir"][idx]   = np.mean(rs_dir_rates)
+        results["rs_iso"][idx]   = np.mean(rs_iso_rates)
+
+        print(f"  → GFN_dir={results['gfn_directed'][idx]:.4f}  "
+              f"GFN_iso={results['gfn_iso'][idx]:.4f}  "
+              f"RS_dir={results['rs_dir'][idx]:.4f}  "
+              f"RS_iso={results['rs_iso'][idx]:.4f}")
+
+    return results
 
 
-# ---------------------------------------------------------------------------
-# rcParams
-# ---------------------------------------------------------------------------
+def plot_results(results: dict, out_dir: Path) -> None:
+    """Plot secrecy sum-rate vs P0 — IEEE style, no title."""
 
-def _apply_rcparams():
-    plt.rcParams.update({
-        "font.family":         "serif",
-        "font.serif":          ["Times New Roman", "DejaVu Serif"],
-        "font.size":           11,
-        "axes.linewidth":      0.8,
-        "axes.grid":           True,
-        "grid.linestyle":      "--",
-        "grid.alpha":          0.35,
-        "grid.linewidth":      0.5,
-        "lines.linewidth":     1.5,
-        "lines.markersize":    7,
-        "legend.fontsize":     9,
-        "legend.framealpha":   1.0,
-        "legend.edgecolor":    "black",
-        "legend.fancybox":     False,
-        "xtick.direction":     "in",
-        "ytick.direction":     "in",
-        "xtick.minor.visible": True,
-        "ytick.minor.visible": True,
-    })
+    P0_dBm = results["P0_dBm"]
 
+    fig, ax = plt.subplots(figsize=(7, 5))
 
-def _topology_tag(cfg):
-    return (f"_Eve{cfg.eve_snr_dB:.0f}dB"
-            f"_dbe{cfg.d_be:.0f}m"
-            f"_CU{cfg.d_cu_min:.0f}-{cfg.d_cu_max:.0f}m")
+    ax.plot(P0_dBm, results["gfn_directed"],
+            "o-", color="#0055A4",
+            markerfacecolor="white", markeredgewidth=1.8,
+            label="(GFlowNet with directed AN")
 
+    ax.plot(P0_dBm, results["gfn_iso"],
+            "s-", color="#009E73",
+            markerfacecolor="white", markeredgewidth=1.8,
+            label="GFlowNet with isotropic AN")
 
-# ---------------------------------------------------------------------------
-# Secrecy sum-rate plot
-# ---------------------------------------------------------------------------
+    ax.plot(P0_dBm, results["rs_dir"],
+            "^--", color="#000000",
+            markerfacecolor="white", markeredgewidth=1.8,
+            label="RS with directed AN")
 
-def plot_rsec_vs_snr(
-    snr_db, rsec_B1, rsec_B2, rsec_oracle,
-    rsec_proposed=None, rsec_deepsets=None, rsec_conv_dl=None,
-    cfg=None, save_path=None,
-):
-    if cfg is None:
-        cfg = SystemConfig()
-    _apply_rcparams()
+    ax.plot(P0_dBm, results["rs_iso"],
+            "D-", color="#444444",
+            markerfacecolor="white", markeredgewidth=1.8,
+            label="RS with isotropic AN")
 
-    fig, ax = plt.subplots(figsize=(6.5, 5.0))
-    ms, mw  = 7, 1.5
-
-    ax.plot(snr_db, rsec_oracle,
-            color="#7f7f7f", linestyle="--", marker="s",
-            markerfacecolor="none", markeredgecolor="#7f7f7f",
-            markeredgewidth=mw, markersize=ms, label="Genie-Aided")
-
-    if rsec_proposed is not None:
-        ax.plot(snr_db, rsec_proposed,
-                color="#0000CD", linestyle="-", marker="s",
-                markerfacecolor="none", markeredgecolor="#0000CD",
-                markeredgewidth=mw, markersize=ms, label="Proposed")
-
-    if rsec_deepsets is not None:
-        ax.plot(snr_db, rsec_deepsets,
-                color="#CC0000", linestyle="-", marker="o",
-                markerfacecolor="none", markeredgecolor="#CC0000",
-                markeredgewidth=mw, markersize=ms, label="DeepSets")
-
-    if rsec_conv_dl is not None:
-        ax.plot(snr_db, rsec_conv_dl,
-                color="#228B22", linestyle="-", marker="D",
-                markerfacecolor="none", markeredgecolor="#228B22",
-                markeredgewidth=mw, markersize=ms,
-                label="DL Sched. (Isotropic AN)")
-
-    ax.plot(snr_db, rsec_B2,
-            color="black", linestyle="--", marker="s",
-            markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-            label="RS + Directed AN (B2)")
-
-    ax.plot(snr_db, rsec_B1,
-            color="black", linestyle="-", marker="o",
-            markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-            label="RS + Isotropic AN (B1)")
-
-    ax.set_xlabel("SNR, $\\rho_t$ (dB)", fontsize=11)
-    ax.set_ylabel("Ergodic Secrecy Sum-Rate (bps/Hz)", fontsize=11)
-    ax.set_xlim(left=snr_db[0], right=snr_db[-1])
+    ax.set_xlabel(r"$P_0$ (dBm)")
+    ax.set_ylabel("Secrecy Sum-Rate (bits/s/Hz)")
+    ax.set_xlim([P0_dBm[0], P0_dBm[-1]])
     ax.set_ylim(bottom=0)
-    ax.margins(0)
-    ax.set_xticks(np.arange(snr_db[0], snr_db[-1] + 1, 2))
-    ax.legend(loc="best", handlelength=2.5, borderpad=0.6, labelspacing=0.4)
-    plt.tight_layout(pad=0.5)
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(2.5))
+    ax.legend(frameon=True, edgecolor="#cccccc",
+              fancybox=False, loc="upper left")
 
-    if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        if "rsec_vs_snr" in save_path:
-            base, ext_str = save_path.rsplit(".", 1)
-            save_path = f"{base}{_topology_tag(cfg)}.{ext_str}"
-        ext = save_path.split(".")[-1]
-        fig.savefig(save_path, dpi=300, bbox_inches="tight", format=ext)
-        print(f"\n  Saved -> {save_path}")
+    fig.tight_layout()
 
-    return fig
+    out_path = out_dir / "secrecy_rate_vs_P0.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nPlot saved → {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Secrecy outage probability plot
-# ---------------------------------------------------------------------------
-
-def plot_outage_vs_snr(
-    snr_db, pout_B1, pout_B2, pout_oracle,
-    pout_proposed=None, pout_conv_dl=None,
-    cfg=None, save_path=None,
-):
-    if cfg is None:
-        cfg = SystemConfig()
-    _apply_rcparams()
-
-    fig, ax = plt.subplots(figsize=(6.5, 5.0))
-    ms, mw  = 7, 1.5
-
-    def mask(arr):
-        out = arr.copy().astype(float)
-        out[out == 0.0] = np.nan
-        return out
-
-    ax.semilogy(snr_db, mask(pout_oracle),
-                color="#7f7f7f", linestyle="--", marker="s",
-                markerfacecolor="none", markeredgecolor="#7f7f7f",
-                markeredgewidth=mw, markersize=ms, label="Genie-Aided")
-
-    if pout_proposed is not None:
-        ax.semilogy(snr_db, mask(pout_proposed),
-                    color="#0000CD", linestyle="-", marker="s",
-                    markerfacecolor="none", markeredgecolor="#0000CD",
-                    markeredgewidth=mw, markersize=ms, label="Proposed")
-
-    if pout_conv_dl is not None:
-        ax.semilogy(snr_db, mask(pout_conv_dl),
-                    color="#228B22", linestyle="-", marker="D",
-                    markerfacecolor="none", markeredgecolor="#228B22",
-                    markeredgewidth=mw, markersize=ms,
-                    label="DL Sched. (Isotropic AN)")
-
-    ax.semilogy(snr_db, mask(pout_B2),
-                color="black", linestyle="--", marker="s",
-                markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-                label="RS + Directed AN (B2)")
-
-    ax.semilogy(snr_db, mask(pout_B1),
-                color="black", linestyle="-", marker="o",
-                markerfacecolor="none", markeredgewidth=mw, markersize=ms,
-                label="RS + Isotropic AN (B1)")
-
-    ax.set_xlabel("SNR, $\\rho_t$ (dB)", fontsize=11)
-    ax.set_ylabel("Secrecy Outage Probability", fontsize=11)
-    ax.set_xlim(left=snr_db[0], right=snr_db[-1])
-    ax.set_ylim(bottom=1e-4, top=1.5)
-    ax.margins(x=0)
-    ax.set_xticks(np.arange(snr_db[0], snr_db[-1] + 1, 2))
-    ax.legend(loc="best", handlelength=2.5, borderpad=0.6, labelspacing=0.4)
-    plt.tight_layout(pad=0.5)
-
-    if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        if "outage_vs_snr" in save_path:
-            base, ext_str = save_path.rsplit(".", 1)
-            save_path = f"{base}{_topology_tag(cfg)}.{ext_str}"
-        ext = save_path.split(".")[-1]
-        fig.savefig(save_path, dpi=300, bbox_inches="tight", format=ext)
-        print(f"\n  Saved -> {save_path}")
-
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
+# ----------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------
 if __name__ == "__main__":
-    import matplotlib
-    matplotlib.use("Agg")
 
-    cfg = SystemConfig()
-    print(cfg.summary())
-    print()
+    sys_cfg = SystemConfig()
+    gfn_cfg = GFlowNetConfig(N=sys_cfg.N, K=sys_cfg.K)
+    rng     = np.random.default_rng(sys_cfg.seed + 1)   # different from training
 
-    snr_db, rsec_B1, rsec_B2, rsec_oracle, pout_B1, pout_B2, pout_oracle = \
-        simulate_rsec_vs_snr(cfg)
+    # ── Train GFlowNet ──────────────────────────────────────────
+    print("=" * 60)
+    print("  Phase 1: Training GFlowNet")
+    print("=" * 60)
 
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    gfn = GFlowNet(gfn_cfg)
+    rng_train = np.random.default_rng(sys_cfg.seed)
 
-    for ext in ["png", "pdf"]:
-        fig = plot_rsec_vs_snr(
-            snr_db, rsec_B1, rsec_B2, rsec_oracle,
-            cfg=cfg,
-            save_path=str(cfg.output_dir / f"sim_rsec_vs_snr.{ext}"),
-        )
-        plt.close(fig)
+    # train at middle of P0 sweep
+    P_t_train = 10**(30.0/10.0) * 1e-3   # 30 dBm = 1.0 W
 
-    for ext in ["png", "pdf"]:
-        fig = plot_outage_vs_snr(
-            snr_db, pout_B1, pout_B2, pout_oracle,
-            cfg=cfg,
-            save_path=str(cfg.output_dir / f"sim_outage_vs_snr.{ext}"),
-        )
-        plt.close(fig)
+    gfn.train(
+        sys_cfg   = sys_cfg,
+        P_t       = P_t_train,
+        rng       = rng_train,
+        log_every = gfn_cfg.log_every,
+    )
+    print(f"Training complete. lnZ = {gfn.log_z.item():.4f}")
 
-    print("\n  Done.")
+    # ── Run simulation ───────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  Phase 1: P0 sweep evaluation")
+    print(f"  P0 range: {sys_cfg.P0_dBm_min} - {sys_cfg.P0_dBm_max} dBm")
+    print(f"  Trials per point: {sys_cfg.n_trials}")
+    print(f"  Schemes: GFlowNet directed, GFlowNet iso, RS directed, RS iso")
+    print("=" * 60)
+
+    results = run_simulation(sys_cfg, gfn_cfg, gfn, rng)
+
+    # ── Save raw results ─────────────────────────────────────────
+    out_dir = sys_cfg.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez(
+        out_dir / "results.npz",
+        **results
+    )
+    print(f"Raw results saved → {out_dir / 'results.npz'}")
+
+    # ── Plot ─────────────────────────────────────────────────────
+    plot_results(results, out_dir)

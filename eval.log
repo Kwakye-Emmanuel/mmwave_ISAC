@@ -1,0 +1,27 @@
+nohup: ignoring input
+  Loaded SetTransformerScheduler from checkpoints/isac_set_transformer_Eve20dB_dbe20m_CU40-60m_best.pt
+  Loaded DeepSetsScheduler from checkpoints/isac_deep_sets_Eve20dB_dbe20m_CU40-60m_best.pt
+  Device : cuda
+
+     SNR |       B1 |       B2 |   Oracle |    B3(DL) |   Proposed |   DeepSets
+  --------------------------------------------------------------------------
+    +0.0 |   0.2792 |   0.3679 |   0.7118 |    0.5260 |     0.6513 |     0.6488
+    +2.5 |   0.5033 |   0.6666 |   1.1885 |    0.9100 |     1.1116 |     1.1083
+    +5.0 |   0.8837 |   1.1407 |   1.8832 |    1.5066 |     1.7873 |     1.7831
+    +7.5 |   1.4777 |   1.8283 |   2.8140 |    2.3473 |     2.6984 |     2.6928
+   +10.0 |   2.3171 |   2.7442 |   3.9643 |    3.4211 |     3.8306 |     3.8239
+   +12.5 |   3.3914 |   3.8738 |   5.2916 |    4.6870 |     5.1435 |     5.1357
+   +15.0 |   4.6594 |   5.1805 |   6.7457 |    6.0941 |     6.5871 |     6.5786
+   +17.5 |   6.0698 |   6.6181 |   8.2832 |    7.5978 |     8.1179 |     8.1090
+   +20.0 |   7.5764 |   8.1434 |   9.8717 |    9.1627 |     9.7025 |     9.6932
+  Results saved -> eval_results_Eve20dB_dbe20m_CU40-60m.npz
+
+  Saved -> outputs/eval_rsec_vs_snr_Eve20dB_dbe20m_CU40-60m.png
+
+  Saved -> outputs/eval_rsec_vs_snr_Eve20dB_dbe20m_CU40-60m.pdf
+
+  Saved -> outputs/eval_outage_vs_snr_Eve20dB_dbe20m_CU40-60m.png
+
+  Saved -> outputs/eval_outage_vs_snr_Eve20dB_dbe20m_CU40-60m.pdf
+
+  Done.

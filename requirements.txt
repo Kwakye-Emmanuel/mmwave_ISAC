@@ -1,40 +1,37 @@
-# ISAC Sensing-Aided PLS Simulation
-# IEEE GLOBECOM 2026
-# ============================================================
-#
-# INSTALL (standard):
-#     pip install -r requirements.txt
-#
-# INSTALL PyTorch separately (avoids SSL issues on Windows):
-#
-#     CUDA 12.1 (NVIDIA GPU recommended for training):
-#         pip install torch --index-url https://download.pytorch.org/whl/cu121
-#
-#     CUDA 11.8:
-#         pip install torch --index-url https://download.pytorch.org/whl/cu118
-#
-#     CPU only:
-#         pip install torch --index-url https://download.pytorch.org/whl/cpu
-#
-# SETUP (Windows PowerShell):
-#     python -m venv .venv
-#     .venv\Scripts\Activate.ps1
-#     pip install -r requirements.txt
-#     pip install torch --index-url https://download.pytorch.org/whl/cu121
-# ============================================================
-
-# Core numerical
-numpy>=1.24.0
-scipy>=1.10.0
-
-# Plotting
-matplotlib>=3.7.0
-
-# Progress bars
-tqdm>=4.65.0
-
-# Configuration
-pyyaml>=6.0
-
-# Deep learning (install separately -- see note above)
-# torch>=2.0.0
+contourpy==1.3.2
+cycler==0.12.1
+filelock==3.25.2
+fonttools==4.62.1
+fsspec==2026.2.0
+Jinja2==3.1.6
+joblib==1.5.3
+kiwisolver==1.5.0
+MarkupSafe==3.0.3
+matplotlib==3.10.8
+mpmath==1.3.0
+networkx==3.4.2
+numpy==2.2.6
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cuda-cupti-cu11==11.8.87
+nvidia-cuda-nvrtc-cu11==11.8.89
+nvidia-cuda-runtime-cu11==11.8.89
+nvidia-cudnn-cu11==9.1.0.70
+nvidia-cufft-cu11==10.9.0.58
+nvidia-curand-cu11==10.3.0.86
+nvidia-cusolver-cu11==11.4.1.48
+nvidia-cusparse-cu11==11.7.5.86
+nvidia-nccl-cu11==2.21.5
+nvidia-nvtx-cu11==11.8.86
+packaging==26.0
+pillow==12.1.1
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+scipy==1.15.3
+six==1.17.0
+sympy==1.13.1
+torch==2.6.0+cu118
+torchvision==0.21.0+cu118
+tqdm==4.67.3
+triton==3.2.0
+typing_extensions==4.15.0
